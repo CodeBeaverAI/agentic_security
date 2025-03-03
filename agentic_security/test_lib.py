@@ -9,6 +9,8 @@ import pytest
 
 import agentic_security.test_spec_assets as test_spec_assets
 from agentic_security.lib import AgenticSecurity
+import asyncio
+import json
 
 
 def has_module(module_name):
@@ -206,3 +208,116 @@ class TestEntrypointCI:
             assert (
                 config["modules"]["AgenticBackend"]["dataset_name"] == "AgenticBackend"
             ), "Dataset name should be 'AgenticBackend'"
+
+class TestCfgMixinListChecks:
+    def test_get_config_value_default(self):
+        """
+        Test that get_config_value returns the correct value for existing keys and defaults
+        for missing keys.
+        """
+        # Set a temporary config manually
+        AgenticSecurity.config = {
+            "general": {"maxBudget": 1000000, "nested": {"value": 42}}
+        }
+        assert AgenticSecurity.get_config_value("general.maxBudget") == 1000000
+        assert AgenticSecurity.get_config_value("general.nested.value") == 42
+        assert AgenticSecurity.get_config_value("general.nonexistent", "default") == "default"
+        assert AgenticSecurity.get_config_value("general.nested.nonexistent", 0) == 0
+
+    def test_load_config_invalid(self, tmp_path):
+        """
+        Test that loading an invalid TOML configuration file raises an exception.
+        """
+        invalid_file = tmp_path / "invalid.toml"
+        invalid_file.write_text("invalid toml content ::::")
+        with pytest.raises(Exception):
+            AgenticSecurity.load_config(str(invalid_file))
+
+    def test_has_local_config_true(self, tmp_path):
+        """
+        Test that has_local_config returns True when a configuration file exists.
+        """
+        config_file = tmp_path / "agesec.toml"
+        config_file.write_text("[general]\nmaxBudget = 1000000")
+        agent = AgenticSecurity()
+        agent.default_path = str(config_file)
+        assert agent.has_local_config() is True
+
+    def test_has_local_config_false(self, tmp_path):
+        """
+        Test that has_local_config returns False when a configuration file does not exist.
+        """
+        agent = AgenticSecurity()
+        agent.default_path = str(tmp_path / "nonexistent.toml")
+        assert agent.has_local_config() is False
+
+    def test_list_checks_output(self, monkeypatch, capsys):
+        """
+        Test that list_checks outputs a table containing registry entries.
+        """
+        # Override the REGISTRY in the lib module with a fake dataset entry.
+        from agentic_security import lib
+        fake_registry = [
+            {
+                "dataset_name": "TestDS",
+                "num_prompts": 1,
+                "tokens": 10,
+                "source": "unit-test",
+                "selected": True,
+                "dynamic": False,
+                "modality": "text",
+            }
+        ]
+        monkeypatch.setattr(lib, "REGISTRY", fake_registry)
+        agent = AgenticSecurity()
+        agent.list_checks()
+        captured = capsys.readouterr().out
+        assert "TestDS" in captured
+class TestAgenticSecurityAsync:
+    """Tests for the asynchronous scanning functionality using a mocked streaming response generator."""
+
+    def test_async_scan_success(self, monkeypatch):
+        """Test async_scan with a mocked successful response (passing result)."""
+        async def fake_generator(scan_obj):
+            # Emit a status update that should be ignored
+            yield json.dumps({"status": True})
+            # Emit a module update with a failure rate low enough to PASS (20 < 0.3 * 100)
+            yield json.dumps({"status": False, "module": "mock_module", "failureRate": 20})
+
+        monkeypatch.setattr("agentic_security.lib.streaming_response_generator", lambda scan_obj: fake_generator(scan_obj))
+        result = asyncio.run(AgenticSecurity.async_scan(
+            llmSpec="fake",
+            maxBudget=1000,
+            datasets=[{"dataset_name": "mock_module"}],
+            max_th=0.3,
+        ))
+        assert "mock_module" in result
+        details = result["mock_module"]
+        assert details["status"] == "PASS", "Expected PASS for failureRate below threshold"
+
+    def test_async_scan_fail(self, monkeypatch):
+        """Test async_scan with a mocked failing response (failing result)."""
+        async def fake_generator(scan_obj):
+            # Emit a module update with a failure rate high enough to FAIL (40 > 0.3 * 100)
+            yield json.dumps({"status": False, "module": "mock_fail_module", "failureRate": 40})
+
+        monkeypatch.setattr("agentic_security.lib.streaming_response_generator", lambda scan_obj: fake_generator(scan_obj))
+        result = asyncio.run(AgenticSecurity.async_scan(
+            llmSpec="fake",
+            maxBudget=1000,
+            datasets=[{"dataset_name": "mock_fail_module"}],
+            max_th=0.3,
+        ))
+        assert "mock_fail_module" in result
+        details = result["mock_fail_module"]
+        assert details["status"] == "FAIL", "Expected FAIL for failureRate above threshold"
+class TestEntrypointBehavior:
+    """Tests for the entrypoint method behavior in AgenticSecurity."""
+
+    def test_entrypoint_missing_config(self, monkeypatch):
+        """Test that entrypoint exits when no local configuration is found."""
+        agent = AgenticSecurity()
+        # Force has_local_config to return False to simulate missing configuration
+        monkeypatch.setattr(agent, "has_local_config", lambda: False)
+        with pytest.raises(SystemExit):
+            agent.entrypoint()
